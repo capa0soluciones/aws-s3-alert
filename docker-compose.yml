@@ -1,0 +1,16 @@
+# Docker-compose para ejecutar script de Python
+version: '3.8'
+services:
+  python-script:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: python3 app.py
+    networks:
+      - python-script-network
+networks:
+  python-script-network:
+    driver: bridge

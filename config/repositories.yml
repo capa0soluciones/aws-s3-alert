@@ -1,0 +1,5 @@
+repositories:
+  - name: "Name"
+    bucket: "s3://bucket-name"
+    profile: "default"
+    tagg: "Tagg"
