@@ -30,12 +30,10 @@ smtp_password = os.getenv('SMPT_PASSWORD')
 alert_from = os.getenv('ALERT_FROM')
 alerto_to = os.getenv('ALERT_TO')
 
-# Cargar la configuración desde el archivo YAML
 def load_config(file_path):
     with open(file_path, 'r') as file:
         return yaml.safe_load(file)
 
-# Leer el archivo de configuración de credenciales AWS en formato credentials
 def load_aws_credentials(file_path):
     with open(file_path, 'r') as file:
         credentials = {}
@@ -44,7 +42,7 @@ def load_aws_credentials(file_path):
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-            if line.startswith('[') and line.endswith(']'):  # Detectar un nuevo perfil
+            if line.startswith('[') and line.endswith(']'):
                 current_profile = line[1:-1].strip()
                 credentials[current_profile] = {}
             elif '=' in line and current_profile:
@@ -52,10 +50,8 @@ def load_aws_credentials(file_path):
                 credentials[current_profile][key.strip()] = value.strip()
         return credentials
 
-# Inicializar el cliente de S3 usando un perfil específico
 def initialize_s3_client_with_profile(profile_name):
     try:
-        # Leer las credenciales del perfil
         credentials = AWS_CREDENTIALS.get(profile_name, {})
         aws_access_key_id = credentials.get('aws_access_key_id')
         aws_secret_access_key = credentials.get('aws_secret_access_key')
@@ -67,13 +63,12 @@ def initialize_s3_client_with_profile(profile_name):
                 send_mail(subject, body)
             raise ValueError(f"Credenciales no encontradas o incompletas para el perfil: {profile_name}")
 
-        # Crear el cliente de S3
         s3_client = boto3.client(
             's3',
             region_name=AWS_REGION,
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
-            config=Config(connect_timeout=10, read_timeout=30)  # Tiempo de espera en segundos
+            config=Config(connect_timeout=10, read_timeout=30)
         )
         return s3_client
     except EndpointConnectionError as e:
@@ -91,6 +86,52 @@ def initialize_s3_client_with_profile(profile_name):
         print(f"ERROR: Error al inicializar el cliente S3 para el perfil {profile_name}: {e}")
         raise
 
+def compare_file_sizes(s3_client, bucket_name, prefix):
+    try:
+        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+        if 'Contents' not in response or len(response['Contents']) < 2:
+            return None
+
+        sorted_objects = sorted(response['Contents'], key=lambda obj: obj['LastModified'], reverse=True)
+        latest_file = sorted_objects[0]
+        second_latest_file = sorted_objects[1]
+        latest_size = latest_file['Size']
+        second_latest_size = second_latest_file['Size']
+
+        percentage_change = ((latest_size - second_latest_size) / second_latest_size) * 100
+
+        if percentage_change > float(ALERT_SIZE_CHANGE_SIZE):
+            return True
+        else:
+            return False
+    except Exception:
+        return None
+
+def human_readable_size(size_in_bytes):
+    for unit in ['bytes', 'KB', 'MB', 'GB', 'TB']:
+        if size_in_bytes < 1024:
+            return f"{size_in_bytes:.2f} {unit}"
+        size_in_bytes /= 1024
+
+def send_mail(subject, body, html=False):
+    message = MIMEMultipart()
+    message["From"] = formataddr((alert_from, smtp_user))
+    message["To"] = alerto_to
+    message["Subject"] = subject
+    if html:
+        message.attach(MIMEText(body, "html"))
+    else:
+        message.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(smtp_server, int(smtp_port)) as servidor:
+            servidor.starttls()
+            servidor.login(smtp_user, smtp_password)
+            servidor.send_message(message)
+            print("Correo enviado exitosamente.")
+    except Exception as e:
+        print(f"Error al enviar el correo: {e}")
+
 def check_repositories_for_today(config):
     try:
         print("Iniciando la verificación de repositorios...")
@@ -102,7 +143,13 @@ def check_repositories_for_today(config):
                 grouped_repositories[profile_name] = []
             grouped_repositories[profile_name].append(repo)
 
-        repo_details = []  # Para el detalle de cada repo
+        # Acumuladores globales para el resumen final
+        all_success_repos = []
+        all_success_repos_compare = []
+        all_failure_repos = []
+        all_failure_repos_compare = []
+        all_repo_details_html = []
+        total_repos = 0
 
         for profile_name, repositories in grouped_repositories.items():
             print(f"\nProcesando grupo de repositorios con el perfil: {profile_name}\n")
@@ -120,12 +167,8 @@ def check_repositories_for_today(config):
                 print(f"FAIL: Error al inicializar cliente S3 para el perfil {profile_name}: {e}\n")
                 continue
 
-            success_repos = []
-            success_repos_compare = []
-            failure_repos = []
-            failure_repos_compare = []
-
             for repo in repositories:
+                total_repos += 1
                 bucket_url = repo['bucket']
                 bucket_parts = bucket_url.replace("s3://", "").split("/", 1)
                 bucket_name = bucket_parts[0]
@@ -133,90 +176,104 @@ def check_repositories_for_today(config):
 
                 try:
                     response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
-                    detail = f"\nRepositorio: {repo['name']} ({repo.get('tagg', 'No Tag')})\n"
+                    repo_name = repo['name']
+                    repo_tagg = repo.get('tagg', 'No Tag')
+                    detail_html = f"<div style='margin-bottom:18px;'><b>{repo_name}</b> <span style='color:#888;'>({repo_tagg})</span><br>"
+
                     if 'Contents' in response:
                         today = datetime.now().date()
                         has_today_file = any(
                             obj['LastModified'].date() == today for obj in response.get('Contents', [])
                         )
 
+                        archivos = sorted(response['Contents'], key=lambda obj: obj['LastModified'], reverse=True)[:10]
                         if has_today_file:
-                            print(f"{repo['name']} ({repo.get('tagg', 'No Tag')}) Se realizó OK el día de hoy.")
-                            success_repos.append(f"{repo['name']} ({repo.get('tagg', 'No Tag')})")
-                            detail += "Estado: OK - Se realizó backup hoy.\n"
-                            archivos = sorted(response['Contents'], key=lambda obj: obj['LastModified'], reverse=True)
+                            all_success_repos.append(f"{repo_name} ({repo_tagg})")
+                            detail_html += "<span style='color:green;'>✅ Estado: OK - Se realizó backup hoy.</span><br>"
+                            detail_html += "<ul style='margin:6px 0 6px 0;'>"
                             for obj in archivos:
                                 size_human = human_readable_size(obj['Size'])
                                 fecha = obj['LastModified'].strftime('%Y-%m-%d %H:%M:%S')
-                                detail += f"  - {obj['Key']} | {size_human} | {fecha}\n"
+                                detail_html += f"<li>{obj['Key']} | {size_human} | {fecha}</li>"
+                            detail_html += "</ul>"
                             compare = compare_file_sizes(s3_client, bucket_name, prefix)
                             if compare is True:
-                                detail += "  * Cambio significativo en el tamaño de los archivos.\n"
-                                failure_repos_compare.append(f"{repo['name']} ({repo.get('tagg', 'No Tag')})")
+                                detail_html += "<span style='color:red;'>❗ Cambio significativo en el tamaño de los archivos.</span><br>"
+                                all_failure_repos_compare.append(f"{repo_name} ({repo_tagg})")
                             elif compare is False:
-                                detail += "  * No se detectó un cambio significativo en el tamaño de los archivos.\n"
-                                success_repos_compare.append(f"{repo['name']} ({repo.get('tagg', 'No Tag')})")
-                            print("\n")
+                                detail_html += "<span style='color:green;'>✔ No se detectó un cambio significativo en el tamaño de los archivos.</span><br>"
+                                all_success_repos_compare.append(f"{repo_name} ({repo_tagg})")
                         else:
-                            failure_repos.append(f"{repo['name']} ({repo.get('tagg', 'No Tag')})")
-                            detail += "Estado: FAIL - No se encontró archivo con fecha de hoy.\n"
-                            print(f"{repo['name']} ({repo.get('tagg', 'No Tag')}) - No se encontró archivo con fecha de hoy.\n")
+                            all_failure_repos.append(f"{repo_name} ({repo_tagg})")
+                            detail_html += "<span style='color:red;'>❌ Estado: FAIL - No se encontró archivo con fecha de hoy.</span><br>"
+                            detail_html += "<ul style='margin:6px 0 6px 0;'>"
+                            for obj in archivos:
+                                size_human = human_readable_size(obj['Size'])
+                                fecha = obj['LastModified'].strftime('%Y-%m-%d %H:%M:%S')
+                                detail_html += f"<li>{obj['Key']} | {size_human} | {fecha}</li>"
+                            detail_html += "</ul>"
                     else:
-                        failure_repos.append(f"{repo['name']} ({repo.get('tagg', 'No Tag')})")
-                        detail += "Estado: FAIL - No se encontraron objetos.\n"
-                        print(f"{repo['name']} ({repo.get('tagg', 'No Tag')}) - No se encontraron objetos.")
-                    repo_details.append(detail)
+                        all_failure_repos.append(f"{repo_name} ({repo_tagg})")
+                        detail_html += "<span style='color:red;'>❌ Estado: FAIL - No se encontraron objetos.</span><br>"
+                    detail_html += "</div>"
+                    all_repo_details_html.append(detail_html)
                 except ClientError as e:
+                    repo_name = repo['name']
+                    repo_tagg = repo.get('tagg', 'No Tag')
                     if e.response['Error']['Code'] == 'NoSuchBucket':
-                        print(f"FAIL: El bucket {bucket_name} no existe.")
-                        failure_repos.append(f"{repo['name']} ({repo.get('tagg', 'No Tag')})")
-                        repo_details.append(f"\nRepositorio: {repo['name']} ({repo.get('tagg', 'No Tag')})\nEstado: FAIL - El bucket no existe.\n")
+                        all_failure_repos.append(f"{repo_name} ({repo_tagg})")
+                        all_repo_details_html.append(
+                            f"<div style='margin-bottom:18px;'><b>{repo_name}</b> <span style='color:#888;'>({repo_tagg})</span><br>"
+                            "<span style='color:red;'>❌ Estado: FAIL - El bucket no existe.</span></div>"
+                        )
                     elif e.response['Error']['Code'] == 'InvalidBucketName':
-                        print(f"FAIL: Nombre de bucket inválido: {bucket_name}")
-                        failure_repos.append(f"{repo['name']} ({repo.get('tagg', 'No Tag')})")
-                        repo_details.append(f"\nRepositorio: {repo['name']} ({repo.get('tagg', 'No Tag')})\nEstado: FAIL - Nombre de bucket inválido.\n")
+                        all_failure_repos.append(f"{repo_name} ({repo_tagg})")
+                        all_repo_details_html.append(
+                            f"<div style='margin-bottom:18px;'><b>{repo_name}</b> <span style='color:#888;'>({repo_tagg})</span><br>"
+                            "<span style='color:red;'>❌ Estado: FAIL - Nombre de bucket inválido.</span></div>"
+                        )
                     else:
-                        print(f"FAIL: Error al listar objetos en el bucket {bucket_name}: {e}")
-                        failure_repos.append(f"{repo['name']} ({repo.get('tagg', 'No Tag')})")
-                        repo_details.append(f"\nRepositorio: {repo['name']} ({repo.get('tagg', 'No Tag')})\nEstado: FAIL - Error al listar objetos: {e}\n")
-                    print(f"FAIL: {repo['name']} ({repo.get('tagg', 'No Tag')}) - Error al listar objetos: {e}")
+                        all_failure_repos.append(f"{repo_name} ({repo_tagg})")
+                        all_repo_details_html.append(
+                            f"<div style='margin-bottom:18px;'><b>{repo_name}</b> <span style='color:#888;'>({repo_tagg})</span><br>"
+                            f"<span style='color:red;'>❌ Estado: FAIL - Error al listar objetos: {e}</span></div>"
+                        )
 
-            print("\nResumen de la verificación de repositorios:")
-            print(f"Repositorios procesados: {len(repositories)}")
-            print(f"Repositorios exitosos: {len(success_repos)}")
-            print(f"Lista de repositorios exitosos:\n" + "\n".join(f"- {repo}" for repo in success_repos))
-            print(f"Lista de repositorios fallidos:\n" + "\n".join(f"- {repo}" for repo in failure_repos))
-            print(f"Repositorios fallidos: {len(failure_repos)}")
-            print(f"Repositorios con cambio de tamaño: {len(failure_repos_compare)}")
-            print(f"Repositorios sin cambio de tamaño: {len(success_repos_compare)}")
+        # ENVÍO DE ALERTAS INDIVIDUALES (opcional, puedes mantenerlo si quieres alertas inmediatas)
+        if len(all_failure_repos) > 0 and SEND_ALERTS_ON_NO_FILE == 'True':
+            subject = "BACKUP FALLIDO - No se encontró archivo " + datetime.now().strftime("%Y-%m-%d")
+            body = "Se encontraron errores al verificar los siguientes repositorios:<br>" + "<br>".join(f"- {repo}" for repo in all_failure_repos)
+            send_mail(subject, body, html=True)
+        if len(all_failure_repos_compare) > 0 and SEND_ALERTS_ON_SIZE_CHANGE == 'True':
+            subject = "BACKUP FALLIDO - Cambio significativo en el tamaño de los archivos " + datetime.now().strftime("%Y-%m-%d")
+            body = "Se encontraron cambios significativos en el tamaño de los siguientes repositorios:<br>" + "<br>".join(f"- {repo}" for repo in all_failure_repos_compare)
+            send_mail(subject, body, html=True)
 
-            if len(failure_repos) > 0 and SEND_ALERTS_ON_NO_FILE == 'True':
-                subject = "BACKUP FALLIDO - No se encontró archivo " + datetime.now().strftime("%Y-%m-%d")
-                body = f"Se encontraron errores al verificar los siguientes repositorios:\n" + "\n".join(f"- {repo}" for repo in failure_repos)
-                send_mail(subject, body)
-            if len(failure_repos_compare) > 0 and SEND_ALERTS_ON_SIZE_CHANGE == 'True':
-                subject = "BACKUP FALLIDO - Tamaño " + datetime.now().strftime("%Y-%m-%d")
-                body = f"Se encontraron cambios significativos en el tamaño de los siguientes repositorios:\n" + "\n".join(f"- {repo}" for repo in failure_repos_compare)
-                send_mail(subject, body)
-            if len(success_repos) > 0 and SEND_DAILY_STATUS == 'True':
-                subject = "Backup Daily status de: " + datetime.now().strftime("%Y-%m-%d")
-                body = (
-                    "Resumen de la verificación de repositorios:\n"
-                    "Backup exitosos:\n" +
-                    "\n".join(f"- {repo}" for repo in success_repos) +
-                    "\n\nBackup fallidos:\n" +
-                    "\n".join(f"- {repo}" for repo in failure_repos) +
-                    "\n"
-                    "\n"
-                    f"Repositorios procesados: {len(repositories)}\n"
-                    f"Repositorios exitosos: {len(success_repos)}\n"
-                    f"Repositorios fallidos: {len(failure_repos)}\n"
-                    f"Repositorios con cambio de tamaño: {len(failure_repos_compare)}\n"
-                    f"Repositorios sin cambio de tamaño: {len(success_repos_compare)}\n"
-                    "\nDETALLE POR REPOSITORIO:\n"
-                    + "\n".join(repo_details)
-                )
-                send_mail(subject, body)
+        # ENVÍO DEL STATUS DIARIO (UN SOLO MAIL)
+        if SEND_DAILY_STATUS == 'True':
+            subject = "Backup Daily status - Resumen de la verificación de repositorios " + datetime.now().strftime("%Y-%m-%d")
+            body = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif;">
+                <h2>Resumen de la verificación de repositorios</h2>
+                <p><b>Repositorios procesados:</b> {total_repos}</p>
+                <p><b style='color:green;'>✅ Backups exitosos ({len(all_success_repos)}):</b><br>
+                {"<br>".join(f"<span style='color:green;'>✅ {repo}</span>" for repo in all_success_repos) or "<span style='color:gray;'>Ninguno</span>"}
+                </p>
+                <p><b style='color:red;'>❌ Backups fallidos ({len(all_failure_repos)}):</b><br>
+                {"<br>".join(f"<span style='color:red;'>❌ {repo}</span>" for repo in all_failure_repos) or "<span style='color:gray;'>Ninguno</span>"}
+                </p>
+                <p><b style='color:orange;'>⚠️ Backups con cambio de tamaño ({len(all_failure_repos_compare)}):</b><br>
+                {"<br>".join(f"<span style='color:orange;'>⚠️ {repo}</span>" for repo in all_failure_repos_compare) or "<span style='color:gray;'>Ninguno</span>"}
+                </p>
+                <p><b>Repositorios sin cambio de tamaño:</b> {len(all_success_repos_compare)}</p>
+                <hr>
+                <h3>Detalle por repositorio (últimos 10 archivos)</h3>
+                {''.join(all_repo_details_html)}
+            </body>
+            </html>
+            """
+            send_mail(subject, body, html=True)
     except Exception as e:
         if SEND_ALERTS_ON_AWS_ERROR == 'True':
             subject = "Error inesperado al verificar los repositorios"
@@ -225,71 +282,7 @@ def check_repositories_for_today(config):
         print(f"ERROR: Error inesperado al verificar los repositorios: {e}")
         raise
 
-def compare_file_sizes(s3_client, bucket_name, prefix):
-    try:
-        print(f"Comparando tamaños de archivos en el bucket: {bucket_name} con prefijo: {prefix}")
-
-        # Listar objetos en el bucket
-        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
-        if 'Contents' not in response or len(response['Contents']) < 2:
-            print(f"No hay suficientes archivos en el bucket {bucket_name} con prefijo {prefix} para comparar.")
-            return
-
-        # Ordenar los objetos por fecha de modificación (de más reciente a más antiguo)
-        sorted_objects = sorted(response['Contents'], key=lambda obj: obj['LastModified'], reverse=True)
-
-        # Obtener el último y el anteúltimo archivo
-        latest_file = sorted_objects[0]
-        second_latest_file = sorted_objects[1]
-
-        # Obtener los tamaños de los archivos
-        latest_size = latest_file['Size']
-        second_latest_size = second_latest_file['Size']
-
-        percentage_change = ((latest_size - second_latest_size) / second_latest_size) * 100
-
-        # Convertir los tamaños a un formato legible
-        latest_size_human = human_readable_size(latest_size)
-        second_latest_size_human = human_readable_size(second_latest_size)
-
-        # Imprimir el resultado
-        print(f"Último archivo: {latest_file['Key']} (Tamaño: {latest_size_human})")
-        print(f"Anteúltimo archivo: {second_latest_file['Key']} (Tamaño: {second_latest_size_human})")
-        if percentage_change > float(ALERT_SIZE_CHANGE_SIZE):
-            return True
-        else:
-            return False
-    except ClientError as e:
-        print(f"FAIL: Error al listar objetos en el bucket {bucket_name}: {e}")
-    except Exception as e:
-        print(f"ERROR: Error inesperado al comparar tamaños de archivos: {e}")
-
-def human_readable_size(size_in_bytes):
-    """Convierte un tamaño en bytes a un formato legible (KB, MB, GB, etc.)."""
-    for unit in ['bytes', 'KB', 'MB', 'GB', 'TB']:
-        if size_in_bytes < 1024:
-            return f"{size_in_bytes:.2f} {unit}"
-        size_in_bytes /= 1024
-
-def send_mail(subject, body):
-
-    message = MIMEMultipart()
-    message["From"] = formataddr((alert_from, smtp_user))
-    message["To"] = alerto_to
-    message["Subject"] = subject
-    message.attach(MIMEText(body, "plain"))
-
-    try:
-        with smtplib.SMTP(smtp_server, smtp_port) as servidor:
-            servidor.starttls()
-            servidor.login(smtp_user, smtp_password)
-            servidor.send_message(message)
-            print("Correo enviado exitosamente.")
-    except Exception as e:
-        print(f"Error al enviar el correo: {e}")
-
 CONFIG = load_config(CONFIG_FILE)
 AWS_CREDENTIALS = load_aws_credentials(AWS_CREDENTIALS_FILE)
 
 check_repositories_for_today(CONFIG)
-
