@@ -198,7 +198,7 @@ def check_repositories_for_today(config):
                             detail_html += "</ul>"
                             compare = compare_file_sizes(s3_client, bucket_name, prefix)
                             if compare is True:
-                                detail_html += "<span style='color:red;'>❗ Cambio significativo en el tamaño de los archivos.</span><br>"
+                                detail_html += "<span style='color:orange;'>⚠️ Cambio significativo en el tamaño de los archivos.</span><br>"
                                 all_failure_repos_compare.append(f"{repo_name} ({repo_tagg})")
                             elif compare is False:
                                 detail_html += "<span style='color:green;'>✔ No se detectó un cambio significativo en el tamaño de los archivos.</span><br>"
